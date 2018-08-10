@@ -5,7 +5,12 @@ import tensorflow as tf
 import cv2
 import numpy as np
 import os
+import heapq
 import yaml
+
+from utils import get_image_coords, get_offset_point, within_radius_of_corresponding_point
+from decode_pose import decode_pose
+
 
 # GLOBALS
 MANIFEST_FILENAME = "manifest.json"
@@ -13,6 +18,12 @@ CONFIG_PATH = "converter/config.yaml"
 WEIGHTS_PATH = "converter/waits"
 INPUT_IMAGE_PATH = "converter/images/tennis_in_crowd.jpg"
 OUTPUT_IMAGE_PATH = "output.jpg"
+
+K_LOCAL_MAXIMUM_RADIUS = 1  # TODO: WHAT? They use 1 in implementation but not in paper
+SCORE_THRESHOLD = 0.5
+NMS_RADIUS = 20  # TODO: Not used?? the same as K_LOCAL_MAXIMUM_RADIUS?
+OUTPUT_STRIDE = 16
+MAX_POSE_DETECTIONS = 5  # TODO: Increase!
 
 
 def toOutputStridedLayers(convolutionDefinition, outputStride):
@@ -95,6 +106,70 @@ def separableConv(inputs, stride, blockID, dilations):
     return w
 
 
+def decode_multiple_poses(heatmap_scores, offsets, displacements_fwd, displacements_bwd,
+                          output_stride, max_pose_detections, score_threshold=0.5, nms_radius=20):
+    poses = []
+    queue = build_part_with_score_queue(score_threshold, K_LOCAL_MAXIMUM_RADIUS, heatmap_scores)
+    squared_nms_radius = nms_radius ** 2
+
+    while len(poses) < max_pose_detections and len(queue) != 0:
+        root = heapq.heappop(queue)
+        root_image_coords = get_image_coords(root[1], output_stride, offsets)
+
+        if within_radius_of_corresponding_point(poses, squared_nms_radius,
+                                                root_image_coords, root[1]['keypoint_id']):
+            continue
+
+        keypoints = decode_pose(root, heatmap_scores, offsets, output_stride,
+                                displacements_fwd, displacements_bwd)
+
+
+def build_part_with_score_queue(score_threshold, local_max_radius, heatmap_scores):
+    height, width, num_keypoints = heatmap_scores.shape
+    queue = []  # We'll use a reversed heapq to implement a max heap
+    for heatmap_y in range(height):
+        for heatmap_x in range(width):
+            for keypoint_id in range(num_keypoints):
+                score = heatmap_scores[heatmap_y, heatmap_x, keypoint_id]  # TODO check index order
+
+                # Only consider parts with score greater or equal to threshold as root candidates.
+                if score < score_threshold:
+                    continue
+
+                # Only consider keypoints whose score is maximum in a local window.
+                if score_is_maximum_in_local_window(keypoint_id, score, heatmap_y, heatmap_x,
+                                                    local_max_radius, heatmap_scores):
+                    # For some reason python only allows min heaps (not max heaps)
+                    # so I negate the score 🤮
+                    heapq.heappush(
+                        queue,
+                        (-score, {'heatmap_y': heatmap_y, 'heatmap_x': heatmap_x, 'keypoint_id': keypoint_id})
+                    )
+    return queue
+
+
+def score_is_maximum_in_local_window(keypoint_id, score, heatmap_y, heatmap_x,
+                                     local_max_radius, heatmap_scores):
+    # TODO: I could easily vectorize this whole function.
+    #       Don't know if it will be faster, due to break saving me iterations though.
+    height, width, _ = heatmap_scores.shape  # We recieve a single layer
+
+    local_maximum = True
+    y_start = max(heatmap_y - local_max_radius, 0)
+    y_end = min(heatmap_y + local_max_radius + 1, height)
+    for y_current in range(y_start, y_end):
+        # TODO: these x_start, x_end, definitions should be defined outside of this loop right?
+        x_start = max(heatmap_x - local_max_radius, 0)
+        x_end = min(heatmap_x + local_max_radius + 1, width)
+        for x_current in range(x_start, x_end):
+            if heatmap_scores[y_current, x_current, keypoint_id] > score:
+                local_maximum = False
+                break
+        if not local_maximum:
+            break
+    return local_maximum
+
+
 # Set up network configuration
 with open(CONFIG_PATH, "r+") as f:
     cfg = yaml.load(f)
@@ -115,7 +190,7 @@ width = imageSize
 height = imageSize
 
 
-# Load weights into layers
+# Load weights from harddrive into `variables` list
 with open(os.path.join(WEIGHTS_PATH, chkpoint, MANIFEST_FILENAME)) as f:
     variables = json.load(f)
 
@@ -147,8 +222,8 @@ with tf.variable_scope(None, 'MobilenetV1'):
 # Define personlab layers and load their weights
 heatmaps = convToOutput(x, 'heatmap_2')
 offsets = convToOutput(x, 'offset_2')
-displacementFwd = convToOutput(x, 'displacement_fwd_2')
-displacementBwd = convToOutput(x, 'displacement_bwd_2')
+displacements_fwd = convToOutput(x, 'displacement_fwd_2')
+displacements_bwd = convToOutput(x, 'displacement_bwd_2')
 heatmaps = tf.sigmoid(heatmaps,'heatmap')
 
 # Define init operations
@@ -158,17 +233,22 @@ with tf.Session() as sess:
     # Initialize network
     sess.run(init)
 
-    # Process input
+    # Format input
     input_image = read_imgfile(INPUT_IMAGE_PATH, width, height)
     input_image = np.array(input_image, dtype=np.float32)
     input_image = input_image.reshape(1, width, height, 3)
 
     # Run input through model
-    heatmaps_result, offsets_result, displacementFwd_result, displacementBwd_result = sess.run(
-        [heatmaps, offsets, displacementFwd, displacementBwd], feed_dict={image: input_image})
-    end = time.time()
-    
-    # DRAW MASK
+    heatmaps_result, offsets_result, displacements_fwd_result, displacements_bwd_result = sess.run(
+        [heatmaps, offsets, displacements_fwd, displacements_bwd], feed_dict={image: input_image})
+
+    # Generate poses from model's output
+    poses = decode_multiple_poses(
+        heatmaps_result[0], offsets_result[0], displacements_fwd_result[0],
+        displacements_bwd_result[0], OUTPUT_STRIDE, MAX_POSE_DETECTIONS, SCORE_THRESHOLD, NMS_RADIUS
+    )
+
+    # Draw mask
     heatmaps_img = (heatmaps_result * 255).astype(np.uint8)[:, :, :, 1][0]
     res = cv2.resize(heatmaps_img, tuple(image.shape[1:3].as_list()), interpolation = cv2.INTER_CUBIC)
     draw_image = cv2.imread(INPUT_IMAGE_PATH)
