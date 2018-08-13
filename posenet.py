@@ -8,8 +8,8 @@ import os
 import heapq
 import yaml
 
-from utils import get_image_coords, get_offset_point, within_radius_of_corresponding_point
-from decode_pose import decode_pose
+from utils import get_image_coords, within_radius_of_corresponding_point, get_valid_resolution, scale_poses
+from decode_pose import decode_pose, get_instance_score
 
 
 # GLOBALS
@@ -24,6 +24,7 @@ SCORE_THRESHOLD = 0.5
 NMS_RADIUS = 20  # TODO: Not used?? the same as K_LOCAL_MAXIMUM_RADIUS?
 OUTPUT_STRIDE = 16
 MAX_POSE_DETECTIONS = 5  # TODO: Increase!
+IMAGE_SCALE_FACTOR = 0.5  # Scale down input image to increase fps
 
 
 def toOutputStridedLayers(convolutionDefinition, outputStride):
@@ -123,6 +124,10 @@ def decode_multiple_poses(heatmap_scores, offsets, displacements_fwd, displaceme
         keypoints = decode_pose(root, heatmap_scores, offsets, output_stride,
                                 displacements_fwd, displacements_bwd)
 
+        score = get_instance_score(poses, squared_nms_radius, keypoints)
+        poses.append({'keypoints': keypoints, 'score': score})
+
+    return poses
 
 def build_part_with_score_queue(score_threshold, local_max_radius, heatmap_scores):
     height, width, num_keypoints = heatmap_scores.shape
@@ -238,7 +243,12 @@ with tf.Session() as sess:
     input_image = np.array(input_image, dtype=np.float32)
     input_image = input_image.reshape(1, width, height, 3)
 
+    # Infer output dimensions
+    resized_height = get_valid_resolution(IMAGE_SCALE_FACTOR, height, OUTPUT_STRIDE)
+    resized_width = get_valid_resolution(IMAGE_SCALE_FACTOR, width, OUTPUT_STRIDE)
+
     # Run input through model
+    # Offsets and displacements have their x's and y's concatenated in the same dim
     heatmaps_result, offsets_result, displacements_fwd_result, displacements_bwd_result = sess.run(
         [heatmaps, offsets, displacements_fwd, displacements_bwd], feed_dict={image: input_image})
 
@@ -248,9 +258,33 @@ with tf.Session() as sess:
         displacements_bwd_result[0], OUTPUT_STRIDE, MAX_POSE_DETECTIONS, SCORE_THRESHOLD, NMS_RADIUS
     )
 
-    # Draw mask
-    heatmaps_img = (heatmaps_result * 255).astype(np.uint8)[:, :, :, 1][0]
-    res = cv2.resize(heatmaps_img, tuple(image.shape[1:3].as_list()), interpolation = cv2.INTER_CUBIC)
-    draw_image = cv2.imread(INPUT_IMAGE_PATH)
-    cv2.imshow('image', (0.7 * np.expand_dims(res, axis=2) + 0.3 * draw_image).astype(np.uint8))
+    # Scale results
+    scale_y = height / resized_height
+    scale_x = width / resized_width
+    scaled_poses = scale_poses(poses, scale_y, scale_x)
+
+    # Convert to cv2 format (is this necessary?)
+    input_image_cv2 = cv2.imread(INPUT_IMAGE_PATH)
+
+    # Draw heatmap
+    heatmap_index = 1  # Change this value to change what to draw
+    heatmaps_img = (heatmaps_result * 255).astype(np.uint8)[:, :, :, heatmap_index][0]
+    resized_heatmaps_img = cv2.resize(
+        heatmaps_img, tuple(image.shape[1:3].as_list()), interpolation = cv2.INTER_CUBIC
+    )
+    cv2.imshow(
+        'image',
+        (0.7 * np.expand_dims(resized_heatmaps_img, axis=2) + 0.3 * input_image_cv2).astype(np.uint8)
+    )
     cv2.waitKey(0)
+
+    # Draw keypoints
+    all_points = [[kp['position']['x'], kp['position']['y']] for person in poses for kp in person['keypoints']]
+    all_points_cv2 = [tuple([int(round(x)), int(round(y))]) for x, y in all_points]
+    for point in all_points_cv2:
+        # cv2.circle(input_image_cv2, point, 5, color, width)
+        cv2.circle(input_image_cv2, point, 5, (255, 255, 255))
+    cv2.imshow('image', input_image_cv2)
+    cv2.waitKey(0)
+
+
