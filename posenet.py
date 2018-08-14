@@ -7,9 +7,11 @@ import numpy as np
 import os
 import heapq
 import yaml
+import random
 
-from utils import get_image_coords, within_radius_of_corresponding_point, get_valid_resolution, scale_poses
+from utils import get_image_coords, within_radius_of_corresponding_point, convert_to_cv2_point
 from decode_pose import decode_pose, get_instance_score
+from keypoints import pose_chain, part_name_to_id_map
 
 
 # GLOBALS
@@ -24,7 +26,6 @@ SCORE_THRESHOLD = 0.5
 NMS_RADIUS = 20  # TODO: Not used?? the same as K_LOCAL_MAXIMUM_RADIUS?
 OUTPUT_STRIDE = 16
 MAX_POSE_DETECTIONS = 5  # TODO: Increase!
-IMAGE_SCALE_FACTOR = 0.5  # Scale down input image to increase fps
 
 
 def toOutputStridedLayers(convolutionDefinition, outputStride):
@@ -59,7 +60,7 @@ def toOutputStridedLayers(convolutionDefinition, outputStride):
 
 def read_imgfile(path, width, height):
     img = cv2.imread(path)
-    img = cv2.resize(img, (width,height))
+    img = cv2.resize(img, (width, height))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(float)
     img = img * (2.0 / 255.0) - 1.0
@@ -67,14 +68,16 @@ def read_imgfile(path, width, height):
 
 
 def convToOutput(mobileNetOutput, outputLayerName):
-    w = tf.nn.conv2d(mobileNetOutput, weights(outputLayerName),[1,1,1,1],padding='SAME')
-    w = tf.nn.bias_add(w,biases(outputLayerName), name=outputLayerName)
+    w = tf.nn.conv2d(mobileNetOutput, weights(outputLayerName), [1, 1, 1, 1], padding='SAME')
+    w = tf.nn.bias_add(w, biases(outputLayerName), name=outputLayerName)
     return w
+
 
 def conv(inputs, stride, blockId):
     return tf.nn.relu6(
-        tf.nn.conv2d(inputs, weights("Conv2d_" + str(blockId)), stride, padding='SAME') 
-        + biases("Conv2d_" + str(blockId)))
+        tf.nn.conv2d(inputs, weights("Conv2d_" + str(blockId)), stride, padding='SAME')
+        + biases("Conv2d_" + str(blockId))
+    )
 
 
 def weights(layerName):
@@ -90,17 +93,19 @@ def depthwiseWeights(layerName):
 
 
 def separableConv(inputs, stride, blockID, dilations):
-    if (dilations == None):
-        dilations = [1,1]
-    
+    if dilations is None:
+        dilations = [1, 1]
+
     dwLayer = "Conv2d_" + str(blockID) + "_depthwise"
     pwLayer = "Conv2d_" + str(blockID) + "_pointwise"
-    
-    w = tf.nn.depthwise_conv2d(inputs, depthwiseWeights(dwLayer), stride, 'SAME',rate=dilations, data_format='NHWC')
+
+    w = tf.nn.depthwise_conv2d(
+        inputs, depthwiseWeights(dwLayer), stride, 'SAME', rate=dilations, data_format='NHWC'
+    )
     w = tf.nn.bias_add(w, biases(dwLayer))
     w = tf.nn.relu6(w)
 
-    w = tf.nn.conv2d(w, weights(pwLayer), [1,1,1,1], padding='SAME')
+    w = tf.nn.conv2d(w, weights(pwLayer), [1, 1, 1, 1], padding='SAME')
     w = tf.nn.bias_add(w, biases(pwLayer))
     w = tf.nn.relu6(w)
 
@@ -129,6 +134,7 @@ def decode_multiple_poses(heatmap_scores, offsets, displacements_fwd, displaceme
 
     return poses
 
+
 def build_part_with_score_queue(score_threshold, local_max_radius, heatmap_scores):
     height, width, num_keypoints = heatmap_scores.shape
     queue = []  # We'll use a reversed heapq to implement a max heap
@@ -148,7 +154,9 @@ def build_part_with_score_queue(score_threshold, local_max_radius, heatmap_score
                     # so I negate the score 🤮
                     heapq.heappush(
                         queue,
-                        (-score, {'heatmap_y': heatmap_y, 'heatmap_x': heatmap_x, 'keypoint_id': keypoint_id})
+                        (-score, {'heatmap_y': heatmap_y,
+                                  'heatmap_x': heatmap_x,
+                                  'keypoint_id': keypoint_id})
                     )
     return queue
 
@@ -181,7 +189,7 @@ with open(CONFIG_PATH, "r+") as f:
 checkpoints = cfg['checkpoints']
 imageSize = cfg['imageSize']
 chk = cfg['chk']
-outputStride = cfg['outputStride']
+outputStride = OUTPUT_STRIDE
 chkpoint = checkpoints[chk]
 
 if chkpoint == 'mobilenet_v1_050':
@@ -201,19 +209,19 @@ with open(os.path.join(WEIGHTS_PATH, chkpoint, MANIFEST_FILENAME)) as f:
 
 for x in variables:
     filename = variables[x]["filename"]
-    byte = open( os.path.join(WEIGHTS_PATH, chkpoint, filename),'rb').read()
-    fmt = str (int (len(byte) / struct.calcsize('f'))) + 'f'
-    d = struct.unpack(fmt, byte) 
+    byte = open(os.path.join(WEIGHTS_PATH, chkpoint, filename), 'rb').read()
+    fmt = str(int(len(byte) / struct.calcsize('f'))) + 'f'
+    d = struct.unpack(fmt, byte)
     # d = np.array(d,dtype=np.float32)
     d = tf.cast(d, tf.float32)
-    d = tf.reshape(d,variables[x]["shape"])
-    variables[x]["x"] = tf.Variable(d,name=x)
+    d = tf.reshape(d, variables[x]["shape"])
+    variables[x]["x"] = tf.Variable(d, name=x)
 
-image = tf.placeholder(tf.float32, shape=[1, imageSize, imageSize, 3],name='image')
+image = tf.placeholder(tf.float32, shape=[1, imageSize, imageSize, 3], name='image')
 x = image
 
 # Define base network and load its weights
-rate = [1,1]
+rate = [1, 1]
 layers = toOutputStridedLayers(mobileNetArchitectures, outputStride)
 with tf.variable_scope(None, 'MobilenetV1'):
     for m in layers:
@@ -229,7 +237,7 @@ heatmaps = convToOutput(x, 'heatmap_2')
 offsets = convToOutput(x, 'offset_2')
 displacements_fwd = convToOutput(x, 'displacement_fwd_2')
 displacements_bwd = convToOutput(x, 'displacement_bwd_2')
-heatmaps = tf.sigmoid(heatmaps,'heatmap')
+heatmaps = tf.sigmoid(heatmaps, 'heatmap')
 
 # Define init operations
 init = tf.global_variables_initializer()
@@ -238,30 +246,32 @@ with tf.Session() as sess:
     # Initialize network
     sess.run(init)
 
-    # Format input
     input_image = read_imgfile(INPUT_IMAGE_PATH, width, height)
     input_image = np.array(input_image, dtype=np.float32)
-    input_image = input_image.reshape(1, width, height, 3)
+    for _ in range(10):
+        start = time.time()
+        # Resize input
+        input_image = input_image.reshape(1, width, height, 3)
+        after_resize = time.time()
 
-    # Infer output dimensions
-    resized_height = get_valid_resolution(IMAGE_SCALE_FACTOR, height, OUTPUT_STRIDE)
-    resized_width = get_valid_resolution(IMAGE_SCALE_FACTOR, width, OUTPUT_STRIDE)
+        # Run input through model
+        # Offsets and displacements have their x's and y's concatenated in the same dim
+        heatmaps_result, offsets_result, displacements_fwd_result, displacements_bwd_result = sess.run(  # noqa
+            [heatmaps, offsets, displacements_fwd, displacements_bwd], feed_dict={image: input_image})  # noqa
+        after_detect = time.time()
 
-    # Run input through model
-    # Offsets and displacements have their x's and y's concatenated in the same dim
-    heatmaps_result, offsets_result, displacements_fwd_result, displacements_bwd_result = sess.run(
-        [heatmaps, offsets, displacements_fwd, displacements_bwd], feed_dict={image: input_image})
-
-    # Generate poses from model's output
-    poses = decode_multiple_poses(
-        heatmaps_result[0], offsets_result[0], displacements_fwd_result[0],
-        displacements_bwd_result[0], OUTPUT_STRIDE, MAX_POSE_DETECTIONS, SCORE_THRESHOLD, NMS_RADIUS
-    )
-
-    # Scale results
-    scale_y = height / resized_height
-    scale_x = width / resized_width
-    scaled_poses = scale_poses(poses, scale_y, scale_x)
+        # Generate poses from model's output
+        poses = decode_multiple_poses(
+            heatmaps_result[0], offsets_result[0], displacements_fwd_result[0],
+            displacements_bwd_result[0], OUTPUT_STRIDE, MAX_POSE_DETECTIONS, SCORE_THRESHOLD,
+            NMS_RADIUS
+        )
+        after_decode = time.time()
+        print(
+            f"Resize: {after_resize - start: .4f}, "
+            f"Detect: {after_detect - after_resize: .4f}, "
+            f"Decode: {after_decode - after_detect:.4f}"
+        )
 
     # Convert to cv2 format (is this necessary?)
     input_image_cv2 = cv2.imread(INPUT_IMAGE_PATH)
@@ -270,21 +280,40 @@ with tf.Session() as sess:
     heatmap_index = 1  # Change this value to change what to draw
     heatmaps_img = (heatmaps_result * 255).astype(np.uint8)[:, :, :, heatmap_index][0]
     resized_heatmaps_img = cv2.resize(
-        heatmaps_img, tuple(image.shape[1:3].as_list()), interpolation = cv2.INTER_CUBIC
+        heatmaps_img, tuple(image.shape[1:3].as_list()), interpolation=cv2.INTER_CUBIC
     )
-    cv2.imshow(
-        'image',
-        (0.7 * np.expand_dims(resized_heatmaps_img, axis=2) + 0.3 * input_image_cv2).astype(np.uint8)
-    )
+    cv2.imshow('image', (
+        0.7 * np.expand_dims(resized_heatmaps_img, axis=2) + 0.3 * input_image_cv2
+    ).astype(np.uint8))
     cv2.waitKey(0)
 
     # Draw keypoints
-    all_points = [[kp['position']['x'], kp['position']['y']] for person in poses for kp in person['keypoints']]
-    all_points_cv2 = [tuple([int(round(x)), int(round(y))]) for x, y in all_points]
-    for point in all_points_cv2:
-        # cv2.circle(input_image_cv2, point, 5, color, width)
-        cv2.circle(input_image_cv2, point, 5, (255, 255, 255))
+    # all_points = [[kp['position']['x'], kp['position']['y']] for kp in person['keypoints']]
+    # all_points_cv2 = [tuple([int(round(x)), int(round(y))]) for x, y in all_points]
+    child_to_parent_map = {child: part_name_to_id_map[parent] for parent, child in pose_chain}
+    for person in poses:
+        color = (255, 255, 255)
+        color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+        width = 2
+        for keypoint in person['keypoints']:
+            if keypoint['part'] == 'nose':
+                cv2.circle(
+                    input_image_cv2,
+                    convert_to_cv2_point(keypoint['position']),
+                    width, color
+                )
+                # TODO write score
+            else:
+                parent_point_idx = child_to_parent_map[keypoint['part']]
+                parent_point = person['keypoints'][parent_point_idx]
+                cv2.line(
+                    input_image_cv2,
+                    convert_to_cv2_point(keypoint['position']),
+                    convert_to_cv2_point(parent_point['position']),
+                    color,
+                    width
+                )
+
     cv2.imshow('image', input_image_cv2)
+    # cv2.imwrite('lol.png', input_image_cv2)
     cv2.waitKey(0)
-
-

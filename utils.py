@@ -63,3 +63,7 @@ def scale_pose(pose, scale_x, scale_y):
             'position': {'x': kp['position']['x'] * scale_x, 'y': kp['position']['y'] * scale_y}
         } for kp in pose['keypoints']]
     }
+
+
+def convert_to_cv2_point(position):
+    return tuple([int(round(position['x'])), int(round(position['y']))])
