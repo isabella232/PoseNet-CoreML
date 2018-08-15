@@ -50,7 +50,7 @@ def decode_pose(root, heatmap_scores, offsets, output_stride, displacements_fwd,
 
 def traverse_to_target_keypoint(edge_id, source_keypoint, target_keypoint_id, heatmap_scores,
                                 offsets, output_stride, displacements):
-        
+
     height, width, _ = heatmap_scores.shape
 
     # Nearest neighbor interpolation for the source->target displacements.
@@ -58,25 +58,31 @@ def traverse_to_target_keypoint(edge_id, source_keypoint, target_keypoint_id, he
         source_keypoint['position'], output_stride, height, width
     )
 
+    # Get displacement vector located at our source_keypoint's heatmap x & y coordinates
     displacement = get_displacement(edge_id, source_keypoint_indices, displacements)
 
+    # Add that vector to out source_keypoint
     displaced_point = add_vectors(source_keypoint['position'], displacement)
 
+    # Get the heatmap x & y coordinates for the resulting vector
     displaced_point_indices = get_strided_index_near_point(displaced_point, output_stride,
                                                            height, width)
 
+    # Find the offset vector of said coordinates
+    # TODO: Shouldn't we be using Hough voting here??
     offset_point = get_offset_point(displaced_point_indices['y'], displaced_point_indices['x'],
                                     target_keypoint_id, offsets)
 
-    score = heatmap_scores[displaced_point_indices['y'],
-                           displaced_point_indices['x'],
-                           target_keypoint_id]
-
+    # Add it to our previously displayed point to find our target_keypoint!
     target_keypoint = add_vectors(
         {'x': displaced_point_indices['x'] * output_stride,
          'y': displaced_point_indices['y'] * output_stride},
         offset_point  # TODO: I refactored it a bit here, check in case something fails
     )
+
+    score = heatmap_scores[
+        displaced_point_indices['y'], displaced_point_indices['x'], target_keypoint_id
+    ]
 
     return {'position': target_keypoint, 'part': part_names[target_keypoint_id], 'score': score}
 
