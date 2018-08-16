@@ -8,6 +8,7 @@ tensorflow-gpu = "*"
 pyyaml = "*"
 opencv-python = "*"
 numpy = "*"
+click = "*"
 
 [dev-packages]
 

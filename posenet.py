@@ -1,3 +1,5 @@
+import click
+import sys
 import json
 import time
 import struct
@@ -7,7 +9,6 @@ import numpy as np
 import os
 import heapq
 import yaml
-import random
 
 from utils import get_image_coords, within_radius_of_corresponding_point, convert_to_cv2_point
 from decode_pose import decode_pose, get_instance_score
@@ -255,78 +256,112 @@ with tf.Session() as sess:
     # Initialize network
     sess.run(init)
 
-    input_image = read_imgfile(INPUT_IMAGE_PATH, width, height)
-    input_image = np.array(input_image, dtype=np.float32)
-    for _ in range(10):
+    # Read Input Video
+    cap = cv2.VideoCapture(sys.argv[1])
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    delta_t = 1 / fps
+    frame_counter = 0
+    video_progress_bar = click.progressbar(length=total_frames)
+
+    # Setup Output Video
+    output_video_path = sys.argv[2] if len(sys.argv) > 2 else None
+    if output_video_path:
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(sys.argv[2], fourcc, fps, (width, height))  # Width, Height
+
+    # Generate video
+    with video_progress_bar as progress_bar:
         start = time.time()
-        # Resize input
-        input_image = input_image.reshape(1, width, height, 3)
-        after_resize = time.time()
+        for _ in progress_bar:
+            frame_counter += 1
+            # Read frame
+            start_frame = time.time()
+            ret, frame = cap.read()
+            if frame is None:
+                break
 
-        # Run input through model
-        # Offsets and displacements have their x's and y's concatenated in the same dim
-        heatmaps_result, offsets_result, displacements_fwd_result, displacements_bwd_result = sess.run(  # noqa
-            [heatmaps, offsets, displacements_fwd, displacements_bwd], feed_dict={image: input_image})  # noqa
-        after_detect = time.time()
+            # Resize input
+            frame = cv2.resize(frame, (width, height))
+            input_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            input_image = input_image.astype(float)
+            input_image = input_image * (2.0 / 255.0) - 1.0
+            input_image = input_image[np.newaxis, :]
 
-        # Generate poses from model's output
-        poses = decode_multiple_poses(
-            heatmaps_result[0], offsets_result[0], displacements_fwd_result[0],
-            displacements_bwd_result[0], OUTPUT_STRIDE, MAX_POSE_DETECTIONS, PERSON_SCORE_THRESHOLD,
-            PART_SCORE_THRESHOLD, NMS_RADIUS
-        )
-        after_decode = time.time()
-        print(
-            f"Resize: {after_resize - start: .4f}, "
-            f"Detect: {after_detect - after_resize: .4f}, "
-            f"Decode: {after_decode - after_detect:.4f} "
-            f"People: {len(poses)}"
-        )
+            # Run input through model
+            # Offsets and displacements have their x's and y's concatenated in the same dim
+            model_start = time.time()
+            heatmaps_result, offsets_result, displacements_fwd_result, displacements_bwd_result = sess.run(  # noqa
+                [heatmaps, offsets, displacements_fwd, displacements_bwd], feed_dict={image: input_image})  # noqa
+            after_detect = time.time()
+            model_end = time.time()
 
-    # Convert to cv2 format (is this necessary?)
-    input_image_cv2 = cv2.imread(INPUT_IMAGE_PATH)
+            # Generate poses from model's output
+            poses = decode_multiple_poses(
+                heatmaps_result[0], offsets_result[0], displacements_fwd_result[0],
+                displacements_bwd_result[0], OUTPUT_STRIDE, MAX_POSE_DETECTIONS,
+                PERSON_SCORE_THRESHOLD, PART_SCORE_THRESHOLD, NMS_RADIUS
+            )
+            decode_end = time.time()
+            # print(f"{model_end - model_start:.4f} - {decode_end - model_end:.3f}")
 
-    if False:
-        # Draw heatmap
-        heatmap_index = 1  # Change this value to change what to draw
-        heatmaps_img = (heatmaps_result * 255).astype(np.uint8)[:, :, :, heatmap_index][0]
-        resized_heatmaps_img = cv2.resize(
-            heatmaps_img, tuple(image.shape[1:3].as_list()), interpolation=cv2.INTER_CUBIC
-        )
-        cv2.imshow('image', (
-            0.7 * np.expand_dims(resized_heatmaps_img, axis=2) + 0.3 * input_image_cv2
-        ).astype(np.uint8))
-        cv2.waitKey(0)
-
-    # Draw keypoints
-    child_to_parent_map = {child: part_name_to_id_map[parent] for parent, child in pose_chain}
-    for person in poses:
-        color = (255, 255, 255)
-        color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-        width = 2
-        for keypoint in person['keypoints']:
-            if keypoint['part'] == 'nose':
-                cv2.circle(
-                    input_image_cv2,
-                    convert_to_cv2_point(keypoint['position']),
-                    width, color
+            if False:
+                # Draw heatmap
+                heatmap_index = 11  # Change this value to change what to draw
+                heatmaps_img = (heatmaps_result * 255).astype(np.uint8)[:, :, :, heatmap_index][0]
+                resized_heatmaps_img = cv2.resize(
+                    heatmaps_img, tuple(image.shape[1:3].as_list()), interpolation=cv2.INTER_CUBIC
                 )
-                text_position = (int(round(keypoint['position']['x'])),
-                                 int(round(keypoint['position']['y'])) - 10)
-                cv2.putText(input_image_cv2, f"{person['score']:.2f}", text_position,
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
-            else:
-                parent_point_idx = child_to_parent_map[keypoint['part']]
-                parent_point = person['keypoints'][parent_point_idx]
-                cv2.line(
-                    input_image_cv2,
-                    convert_to_cv2_point(keypoint['position']),
-                    convert_to_cv2_point(parent_point['position']),
-                    color,
-                    width
-                )
+                frame = (
+                    0.7 * np.expand_dims(resized_heatmaps_img, axis=2) + 0.3 * frame
+                ).astype(np.uint8)
 
-    resized_image = cv2.resize(input_image_cv2, (2000, 2000))
-    cv2.imshow('image', resized_image)
-    # cv2.imwrite('lol.png', input_image_cv2)
-    cv2.waitKey(0)
+            # Draw keypoints
+            child_to_parent_map = {
+                child: part_name_to_id_map[parent] for parent, child in pose_chain
+            }
+            input_image = frame
+            for person in poses:
+                color = (255, 255, 255)
+                # color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+                line_width = 2
+                for keypoint in person['keypoints']:
+                    if keypoint['score'] < PART_SCORE_THRESHOLD:
+                        continue
+                    if keypoint['part'] == 'nose':
+                        cv2.circle(
+                            input_image,
+                            convert_to_cv2_point(keypoint['position']),
+                            line_width, color
+                        )
+                        text_position = (int(round(keypoint['position']['x'])),
+                                         int(round(keypoint['position']['y'])) - 10)
+                        cv2.putText(input_image, f"{person['score']:.2f}", text_position,
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+                    else:
+                        parent_point_idx = child_to_parent_map[keypoint['part']]
+                        parent_point = person['keypoints'][parent_point_idx]
+                        cv2.line(
+                            input_image,
+                            convert_to_cv2_point(keypoint['position']),
+                            convert_to_cv2_point(parent_point['position']),
+                            color,
+                            line_width
+                        )
+            frame = frame.squeeze()
+            if False:
+                cv2.imshow('image', frame)
+                cv2.waitKey(1)
+            if True:
+                out.write(frame)
+                end = time.time()
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+    if output_video_path:
+        out.release()
+    cap.release()
+    cv2.destroyAllWindows()
+    print("fps {:2f}".format(frame_counter / (end - start)))
