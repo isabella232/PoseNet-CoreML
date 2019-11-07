@@ -260,8 +260,13 @@ with tf.Session() as sess:
     sess.run(init)
 
     # Read Input Video
-    cap = cv2.VideoCapture(sys.argv[1])
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if sys.argv[1] == 'stream':
+        # TODO: Fix
+        total_frames = 1000000
+        cap = cv2.VideoCapture(0)
+    else:
+        cap = cv2.VideoCapture(sys.argv[1])
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -279,6 +284,8 @@ with tf.Session() as sess:
             sys.argv[2], fourcc, fps,
             (INPUT_WIDTH * OUTPUT_VIDEO_SCALE, INPUT_HEIGHT * OUTPUT_VIDEO_SCALE)
         )
+    else:
+        out = None
 
     # Generate video
     with video_progress_bar as progress_bar:
@@ -362,9 +369,8 @@ with tf.Session() as sess:
             frame = frame.squeeze()
             resize_output_start = time.time()
             frame = cv2.resize(frame, None, fx=OUTPUT_VIDEO_SCALE, fy=OUTPUT_VIDEO_SCALE)
-            stream_video = False
             write_frame_start = time.time()
-            if stream_video:
+            if out is None:
                 cv2.imshow('image', frame)
                 cv2.waitKey(1)
             else:
@@ -390,10 +396,9 @@ with tf.Session() as sess:
     cap.release()
     cv2.destroyAllWindows()
 
-    # Profiling
-    sorted_timers = sorted(timers.items(), key=lambda t: t[1], reverse=True)
-    for key, value in sorted_timers:
-            print(f"avg {key:<15} {value / total_frames:>10.4f}s"
-                  f"{(value / timers['total']) * 100:>10.2f}%"
-                  f"{1 / (value / total_frames):>10.0f}fps")
-
+#     # Profiling
+#     sorted_timers = sorted(timers.items(), key=lambda t: t[1], reverse=True)
+#     for key, value in sorted_timers:
+#             print(f"avg {key:<15} {value / total_frames:>10.4f}s"
+#                   f"{1 / (value / total_frames):>10.0f}fps")
+# 
